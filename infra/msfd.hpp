@@ -25,12 +25,63 @@ concept MsfdProblem =
 // Two cache lines: also defeats the adjacent-line prefetcher.
 inline constexpr std::size_t kMsfdAlign = 128;
 
+// Kept at namespace scope: MSVC cannot see an enclosing function
+// template's local enum from a local class (C2065).
+namespace msfd_detail {
+
+// hungry: out of work, waiting
+// claimed: a donor is splitting into this slot
+// work: slot filled, run it
+// done: search over
+enum State : int { hungry, claimed, work, done };
+
+template<class P>
+struct alignas(kMsfdAlign) Slot {
+    alignas(kMsfdAlign) std::atomic<int> state{hungry};
+    std::mutex mu;
+    std::condition_variable cv;
+    alignas(kMsfdAlign) P prob;
+
+    // claimed -> work and hungry -> done go through here so
+    // a waiter cannot miss them; hungry -> claimed need not,
+    // since a waiter keeps sleeping on claimed anyway.
+    void wake(int v) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            state.store(v, std::memory_order_release);
+        }
+        cv.notify_one();
+    }
+
+    // Returns false once the search is over.
+    bool wait_for_work() {
+        auto ready = [&] {
+            const int v = state.load(std::memory_order_acquire);
+            return v == work || v == done;
+        };
+        if (!ready()) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, ready);
+        }
+        return state.load(std::memory_order_relaxed) == work;
+    }
+};
+
+struct alignas(kMsfdAlign) Counter {
+    std::atomic<int> v{0};
+};
+
+}  // namespace msfd_detail
+
 // Runs on dedicated threads, never a work-stealing pool: an
 // out-of-work worker blocks until it is handed work, so all T
 // workers must run concurrently.
 template<MsfdProblem P>
 void msfd(P& root, int n_threads, bool forward_first) {
     using enum std::memory_order;
+    using enum msfd_detail::State;
+    using Slot = msfd_detail::Slot<P>;
+    using Counter = msfd_detail::Counter;
     const int T = std::clamp(n_threads, 1, std::max(1, int(
         std::thread::hardware_concurrency())));
 
@@ -41,46 +92,6 @@ void msfd(P& root, int n_threads, bool forward_first) {
             root.a_step_forward();
         return;
     }
-
-    // hungry: out of work, waiting
-    // claimed: a donor is splitting into this slot
-    // work: slot filled, run it
-    // done: search over
-    enum State : int { hungry, claimed, work, done };
-
-    struct alignas(kMsfdAlign) Slot {
-        alignas(kMsfdAlign) std::atomic<int> state{hungry};
-        std::mutex mu;
-        std::condition_variable cv;
-        alignas(kMsfdAlign) P prob;
-
-        // claimed -> work and hungry -> done go through here so
-        // a waiter cannot miss them; hungry -> claimed need not,
-        // since a waiter keeps sleeping on claimed anyway.
-        void wake(int v) {
-            {
-                std::lock_guard<std::mutex> g(mu);
-                state.store(v, std::memory_order_release);
-            }
-            cv.notify_one();
-        }
-
-        // Returns false once the search is over.
-        bool wait_for_work() {
-            auto ready = [&] {
-                const int v = state.load(std::memory_order_acquire);
-                return v == work || v == done;
-            };
-            if (!ready()) {
-                std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, ready);
-            }
-            return state.load(std::memory_order_relaxed) == work;
-        }
-    };
-    struct alignas(kMsfdAlign) Counter {
-        std::atomic<int> v{0};
-    };
 
     auto slots = std::make_unique<Slot[]>(size_t(T));
     // Worker x is busy or claimed iff it is not counted here, so
