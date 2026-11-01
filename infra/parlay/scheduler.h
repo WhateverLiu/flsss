@@ -65,7 +65,7 @@ struct scheduler {
     worker_id_type worker_id;
     scheduler* my_scheduler;
 
-    workerInfo() : worker_id(UNINITIALIZED), my_scheduler(nullptr) {}
+    constexpr workerInfo() noexcept : worker_id(UNINITIALIZED), my_scheduler(nullptr) {}
     workerInfo(std::size_t worker_id_, scheduler* s) : worker_id(worker_id_), my_scheduler(s) {}
 
     workerInfo& operator=(const workerInfo&) = delete;
@@ -92,7 +92,9 @@ struct scheduler {
   // before it goes to sleep to save CPU time.
   constexpr static std::chrono::microseconds STEAL_TIMEOUT{PARLAY_ELASTIC_STEAL_TIMEOUT};
 
-  static inline thread_local workerInfo worker_info{};
+  // constinit: no per-TU dynamic TLS init routine, which Apple's ld
+  // reports as a duplicate symbol across translation units.
+  static inline constinit thread_local workerInfo worker_info{};
 
  public:
 
